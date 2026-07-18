@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using PaymentService.Models;
+using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Text.Json;
 
@@ -10,18 +11,16 @@ namespace PaymentService.Controllers;
 public class OperationsController : ControllerBase
 {
     private readonly PaymentDbContext _db;
-    private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
     private readonly ILogger<OperationsController> _logger;
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new();
 
     public OperationsController(
         PaymentDbContext db,
-        HttpClient httpClient,
         IConfiguration configuration,
         ILogger<OperationsController> logger)
     {
         _db = db;
-        _httpClient = httpClient;
         _configuration = configuration;
         _logger = logger;
     }
@@ -70,116 +69,124 @@ public class OperationsController : ControllerBase
     [HttpPost("/operations/{id}/submit")]
     public async Task<IActionResult> SubmitOperation(string id)
     {
-        var operation = await _db.Operations
-            .Include(o => o.Events)
-            .FirstOrDefaultAsync(o => o.OperationId == id);
+        var semaphore = _locks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+        await semaphore.WaitAsync();
 
-        if (operation == null)
-            return NotFound(new { error = "Операция не найдена" });
-
-        if (operation.Status != "CREATED")
-            return Ok(operation);
-
-        operation.Status = "PROCESSING";
-
-        operation.Events.Add(new OperationEvent
+        try
         {
-            OperationId = operation.OperationId,
-            Type = "PROCESSING",
-            FromStatus = "CREATED",
-            ToStatus = "PROCESSING",
-            Message = "Submit intent saved, processing started",
-            OccurredAt = DateTime.UtcNow
-        });
+            var operation = await _db.Operations
+                .Include(o => o.Events)
+                .FirstOrDefaultAsync(o => o.OperationId == id);
 
-        await _db.SaveChangesAsync();
+            if (operation == null)
+                return NotFound(new { error = "Операция не найдена" });
 
-        // Запускаем вызов провайдера в фоне (не ждём ответа)
-        _ = Task.Run(() => SendToProviderAsync(operation.OperationId));
+            if (operation.Status != "CREATED")
+                return Ok(operation);
 
-        return Accepted(operation);
+            operation.Status = "PROCESSING";
+
+            operation.Events.Add(new OperationEvent
+            {
+                OperationId = operation.OperationId,
+                Type = "PROCESSING",
+                FromStatus = "CREATED",
+                ToStatus = "PROCESSING",
+                Message = "Submit intent saved, processing started",
+                OccurredAt = DateTime.UtcNow
+            });
+
+            await _db.SaveChangesAsync();
+
+            // Запускаем вызов провайдера в фоне
+            _ = Task.Run(() => SendToProviderAsync(operation.OperationId));
+
+            return Accepted(operation);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
     }
 
-   
-        private async Task SendToProviderAsync(string operationId)
+    private async Task SendToProviderAsync(string operationId)
+    {
+        try
         {
-            try
+            var optionsBuilder = new DbContextOptionsBuilder<PaymentDbContext>();
+            var dbPath = "/data/payments.db";
+            optionsBuilder.UseSqlite($"Data Source={dbPath}");
+
+            using var db = new PaymentDbContext(optionsBuilder.Options);
+            var operation = await db.Operations.FindAsync(operationId);
+
+            if (operation == null || operation.Status != "PROCESSING")
+                return;
+
+            var providerUrl = _configuration["PROVIDER_URL"] ?? "http://provider-simulator:8081";
+
+            var payload = new
             {
-                var optionsBuilder = new DbContextOptionsBuilder<PaymentDbContext>();
-                var dbPath = System.IO.Path.Combine(AppContext.BaseDirectory, "payments.db");
-                optionsBuilder.UseSqlite($"Data Source={dbPath}");
+                operationId = operation.OperationId,
+                amount = operation.Amount,
+                currency = operation.Currency
+            };
 
-                using var db = new PaymentDbContext(optionsBuilder.Options);
-                var operation = await db.Operations.FindAsync(operationId);
+            using var httpClient = new HttpClient();
 
-                if (operation == null || operation.Status != "PROCESSING")
-                    return;
+            var request = new HttpRequestMessage(HttpMethod.Post, $"{providerUrl}/payments")
+            {
+                Content = JsonContent.Create(payload)
+            };
+            request.Headers.Add("Idempotency-Key", operationId);
+            request.Headers.Add("X-Correlation-ID", operationId);
 
-                var providerUrl = _configuration["PROVIDER_URL"] ?? "http://localhost:8081";
+            _logger.LogInformation("Sending payment {OperationId} to provider", operationId);
 
-                var payload = new
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                try
                 {
-                    operationId = operation.OperationId,
-                    amount = operation.Amount,
-                    currency = operation.Currency
-                };
+                    var response = await httpClient.SendAsync(request);
 
-                using var httpClient = new HttpClient();
-
-                var request = new HttpRequestMessage(HttpMethod.Post, $"{providerUrl}/payments")
-                {
-                    Content = JsonContent.Create(payload)
-                };
-                request.Headers.Add("Idempotency-Key", operationId);
-                request.Headers.Add("X-Correlation-ID", operationId);
-
-                _logger.LogInformation("Sending payment {OperationId} to provider", operationId);
-
-                for (int attempt = 1; attempt <= 3; attempt++)
-                {
-                    try
+                    if (response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable && attempt < 3)
                     {
-                        var response = await httpClient.SendAsync(request);
-
-                        if (response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable && attempt < 3)
-                        {
-                            _logger.LogWarning("Provider unavailable for {OperationId}, retry {Attempt}/3", operationId, attempt);
-                            await Task.Delay(TimeSpan.FromMilliseconds(Math.Pow(2, attempt) * 100));
-                            continue;
-                        }
-
-                        if (response.IsSuccessStatusCode)
-                        {
-                            var json = await response.Content.ReadFromJsonAsync<JsonElement>();
-                            var providerPaymentId = json.GetProperty("providerPaymentId").GetGuid();
-
-                            if (operation.ProviderPaymentId == null)
-                            {
-                                operation.ProviderPaymentId = providerPaymentId;
-                                await db.SaveChangesAsync();
-                                _logger.LogInformation("Received providerPaymentId {ProviderId} for {OperationId}", providerPaymentId, operationId);
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Provider returned {StatusCode} for {OperationId}", response.StatusCode, operationId);
-                        }
-
-                        break;
+                        _logger.LogWarning("Provider unavailable for {OperationId}, retry {Attempt}/3", operationId, attempt);
+                        await Task.Delay(TimeSpan.FromMilliseconds(Math.Pow(2, attempt) * 100));
+                        continue;
                     }
-                    catch (HttpRequestException ex) when (attempt < 3)
+
+                    if (response.IsSuccessStatusCode)
                     {
-                        _logger.LogWarning(ex, "Network error for {OperationId}, retry {Attempt}/3", operationId, attempt);
-                        await Task.Delay(TimeSpan.FromMilliseconds(Math.Pow(2, attempt) * 100 + Random.Shared.Next(100)));
+                        var json = await response.Content.ReadFromJsonAsync<JsonElement>();
+                        var providerPaymentId = json.GetProperty("providerPaymentId").GetGuid();
+
+                        if (operation.ProviderPaymentId == null)
+                        {
+                            operation.ProviderPaymentId = providerPaymentId;
+                            await db.SaveChangesAsync();
+                            _logger.LogInformation("Received providerPaymentId {ProviderId} for {OperationId}", providerPaymentId, operationId);
+                        }
                     }
+                    else
+                    {
+                        _logger.LogWarning("Provider returned {StatusCode} for {OperationId}", response.StatusCode, operationId);
+                    }
+
+                    break;
+                }
+                catch (HttpRequestException ex) when (attempt < 3)
+                {
+                    _logger.LogWarning(ex, "Network error for {OperationId}, retry {Attempt}/3", operationId, attempt);
+                    await Task.Delay(TimeSpan.FromMilliseconds(Math.Pow(2, attempt) * 100 + Random.Shared.Next(100)));
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to send {OperationId} to provider", operationId);
-            }
         }
-    
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send {OperationId} to provider", operationId);
+        }
+    }
 
     [HttpPost("/receipts")]
     public async Task<IActionResult> ProcessReceipt([FromBody] ReceiptRequest receipt)
