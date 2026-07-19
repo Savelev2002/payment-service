@@ -20,7 +20,7 @@ curl http://localhost:8080/health
 
 ### 2. Создание операции:
 ```bash
-curl -X POST http://localhost:8080/operations\-H "Content-Type: application/json" \-d'{"operationId":"test001","amount":"1000.00","currency":"RUB","description":"Тест"}'
+curl -X POST http://localhost:8080/operations -H "Content-Type: application/json" -d "{\"operationId\":\"test001\",\"amount\":\"1000.00\",\"currency\":\"RUB\",\"description\":\"Test\"}"
 ```
 
 ### 3. Отправка:
