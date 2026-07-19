@@ -1,10 +1,11 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
-COPY PaymentService.csproj .
-RUN dotnet restore
+COPY PaymentService/PaymentService.csproj PaymentService/
+RUN dotnet restore PaymentService/PaymentService.csproj
 
-COPY . .
+COPY PaymentService/ PaymentService/
+WORKDIR /src/PaymentService
 RUN dotnet publish -c Release -o /app
 
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
