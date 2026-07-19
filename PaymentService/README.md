@@ -1,3 +1,4 @@
+
 # Payment Service
 
 Сервис обработки платежей с идемпотентностью и восстановлением после сбоев.
@@ -13,13 +14,11 @@ docker compose up --build
 ## Сквозной сценарий
 
 ### 1. Проверка здоровья:
-
 ```bash
 curl http://localhost:8080/health
 ```
 
 ### 2. Создание операции:
-
 ```bash
 curl -X POST http://localhost:8080/operations \
   -H "Content-Type: application/json" \
